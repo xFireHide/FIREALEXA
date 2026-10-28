@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+.venv-macos/
+venv/
+node_modules/
+matter_bridge/matter_node/storage/
+matter-storage/
+config.json
+matter-bridge.json
+*.registry.json
+*.matter.json

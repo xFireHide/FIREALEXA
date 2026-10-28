@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "matter-bridge"
+version = "0.1.0"
+description = "Local Matter bridge for eWeLink, Broadlink and Xiaomi miIO devices"
+requires-python = ">=3.11"
+dependencies = [
+    "cryptography>=42.0",
+    "zeroconf>=0.131",
+    "aiohttp>=3.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "mypy>=1.10",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+matter-bridge = "matter_bridge.core.main:main"
+
+[tool.setuptools.package-data]
+matter_bridge = ["matter_node/*.mjs", "matter_node/package.json", "matter_node/package-lock.json"]
+
+[tool.setuptools.packages.find]
+include = ["matter_bridge*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

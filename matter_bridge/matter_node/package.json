@@ -1,0 +1,7 @@
+{
+  "name": "firealexa-matter-bridge",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.13.0" },
+  "dependencies": { "@matter/main": "0.18.0" }
+}
