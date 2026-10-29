@@ -4,6 +4,7 @@ __pycache__/
 .venv-macos/
 venv/
 node_modules/
+*.egg-info/
 matter_bridge/matter_node/storage/
 matter-storage/
 config.json

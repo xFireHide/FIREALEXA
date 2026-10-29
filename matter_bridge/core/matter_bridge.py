@@ -105,7 +105,8 @@ class MatterJsProvider:
         except OSError:
             logger.warning("Could not restrict Matter runtime permissions at %s", runtime_dir)
 
-        runtime_files = ["bridge.mjs", "package.json"]
+        runtime_files = [path.name for path in sorted(package_dir.glob("*.mjs"))]
+        runtime_files.append("package.json")
         has_lockfile = (package_dir / "package-lock.json").is_file()
         if has_lockfile:
             runtime_files.append("package-lock.json")
