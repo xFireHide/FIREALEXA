@@ -86,6 +86,9 @@ server = await ServerNode.create(RootEndpoint, {
     serialNumber: nodeId,
     uniqueId: nodeId,
   },
+  // The spec minimums; the defaults of 0 fail matter.js validation at startup.
+  tlsCertificateManagement: { maxRootCertificates: 5, maxClientCertificates: 2 },
+  tlsClientManagement: { maxProvisioned: 5 },
 });
 server.env.get(FabricManager).events.deleting.on(async fabric => {
   const transports = [...endpoints.values()]

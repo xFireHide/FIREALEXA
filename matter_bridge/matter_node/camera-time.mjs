@@ -1,6 +1,6 @@
 import { TimeSynchronizationServer } from "@matter/main/behaviors/time-synchronization";
 import { TimeSynchronization } from "@matter/main/clusters/time-synchronization";
-import { Status, StatusResponseError } from "@matter/main/types";
+import { MATTER_EPOCH_OFFSET_US, Status, StatusResponseError } from "@matter/main/types";
 import { PeerAddress, Read, Val } from "@matter/protocol";
 import { randomBytes, randomUUID } from "node:crypto";
 import { lookup } from "node:dns/promises";
@@ -28,6 +28,21 @@ function validNtpAddress(value) {
   if (isIP(value)) return isIP(value) === 6;
   return value.split(".").every(label => label.length > 0 && label.length <= 63 &&
     /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i.test(label));
+}
+
+// This module keeps time as microseconds since the Matter epoch (2000-01-01),
+// which is also what the UTC storage file holds. matter.js exposes epoch-us
+// attributes and command fields as Unix-epoch microseconds and converts them on
+// the wire, so values are translated only where they cross into matter.js.
+function toMatterJsUs(value) {
+  return value === null || value === undefined ? value : BigInt(value) + MATTER_EPOCH_OFFSET_US;
+}
+
+function fromMatterJsUs(value) {
+  // Invalid types pass through unchanged for the caller's validation to reject;
+  // values before the Matter epoch become negative and are rejected the same way.
+  return typeof value === "bigint" || Number.isSafeInteger(value)
+    ? BigInt(value) - MATTER_EPOCH_OFFSET_US : value;
 }
 
 function validMatterTimestamp(value) {
@@ -306,7 +321,8 @@ export function createCameraTimeServer(clock, getNode = () => undefined) {
       if ((typeof utcTime === "bigint" || Number.isSafeInteger(utcTime)) &&
           Number.isInteger(granularity) && granularity >= G.MinutesGranularity &&
           granularity <= G.MicrosecondsGranularity) {
-        await clock.set({ utcTime, granularity, timeSource: TS.NodeTimeCluster });
+        await clock.set({ utcTime: fromMatterJsUs(utcTime), granularity,
+          timeSource: TS.NodeTimeCluster });
         synchronized = true;
       }
     } catch { /* The trusted fabric peer may be offline; retry on the next interval. */ }
@@ -358,7 +374,9 @@ export function createCameraTimeServer(clock, getNode = () => undefined) {
       scheduleNtp(this.events, this.context);
       scheduleTrustedSource(this.events, this.context);
     }
-    async setUtcTime(request) { await clock.set(request); }
+    async setUtcTime(request) {
+      await clock.set({ ...request, utcTime: fromMatterJsUs(request?.utcTime) });
+    }
     async setDefaultNtp({ defaultNtp: address }) {
       if (!validNtpAddress(address)) throw new StatusResponseError("Invalid NTP address", Status.ConstraintError);
       await persistSettings({ defaultNtp: address });
@@ -391,7 +409,10 @@ export function createCameraTimeServer(clock, getNode = () => undefined) {
       trustedTimeSource = null;
       scheduleTrustedSource(this.events, this.context);
     }
-    async setTimeZone({ timeZone }) {
+    async setTimeZone({ timeZone: requested }) {
+      const timeZone = Array.isArray(requested)
+        ? requested.map(zone => ({ ...zone, validAt: fromMatterJsUs(zone?.validAt) }))
+        : requested;
       if (!Array.isArray(timeZone) || timeZone.length < 1 || timeZone.length > 2 ||
           !validMatterTimestamp(timeZone[0]?.validAt) || BigInt(timeZone[0].validAt) !== 0n ||
           timeZone.some((zone, index) => !Number.isInteger(zone?.offset) ||
@@ -413,7 +434,14 @@ export function createCameraTimeServer(clock, getNode = () => undefined) {
       this.events.dstTableEmpty?.emit(undefined, this.context);
       return { dstOffsetRequired: true };
     }
-    async setDstOffset({ dstOffset }) {
+    async setDstOffset({ dstOffset: requested }) {
+      const dstOffset = Array.isArray(requested)
+        ? requested.map(entry => ({ ...entry,
+          validStarting: fromMatterJsUs(entry?.validStarting),
+          validUntil: entry?.validUntil === null || entry?.validUntil === undefined
+            ? entry?.validUntil : fromMatterJsUs(entry.validUntil),
+        }))
+        : requested;
       if (!Array.isArray(dstOffset) || dstOffset.length > 4 ||
           dstOffset.some((entry, index) => !Number.isInteger(entry?.offset) ||
             entry.offset < -2_147_483_648 || entry.offset > 2_147_483_647 ||
@@ -444,14 +472,21 @@ export function createCameraTimeServer(clock, getNode = () => undefined) {
     static State = class extends Base.State {
       [Val.properties]() {
         return {
-          get utcTime() { return clock.now(); },
+          get utcTime() { return toMatterJsUs(clock.now()); },
           get granularity() { return clock.now() === null ? G.NoTimeGranularity : clock.granularity; },
           get timeSource() { return clock.now() === null ? TS.None : clock.timeSource; },
           get trustedTimeSource() { return trustedTimeSource; },
           get defaultNtp() { return defaultNtp; },
           get supportsDnsResolve() { return true; },
-          get timeZone() { return structuredClone(zones); },
-          get dstOffset() { return structuredClone(dstOffsets); },
+          get timeZone() {
+            return zones.map(zone => ({ ...zone, validAt: toMatterJsUs(zone.validAt) }));
+          },
+          get dstOffset() {
+            return dstOffsets.map(entry => ({ ...entry,
+              validStarting: toMatterJsUs(entry.validStarting),
+              validUntil: toMatterJsUs(entry.validUntil ?? null),
+            }));
+          },
           get localTime() {
             const now = clock.now();
             if (now === null) return null;
@@ -459,7 +494,7 @@ export function createCameraTimeServer(clock, getNode = () => undefined) {
             const dst = [...dstOffsets].reverse().find(entry => BigInt(entry.validStarting) <= now &&
               (entry.validUntil === null || entry.validUntil === undefined || now < BigInt(entry.validUntil)));
             if (!dst) return null;
-            return now + BigInt(zone.offset + dst.offset) * 1_000_000n;
+            return toMatterJsUs(now + BigInt(zone.offset + dst.offset) * 1_000_000n);
           },
           get timeZoneDatabase() { return TimeSynchronization.TimeZoneDatabase.None; },
           get timeZoneListMaxSize() { return 2; },

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { Status, StatusResponseError, StreamUsage } from "@matter/main/types";
+import { MATTER_EPOCH_OFFSET_US, Status, StatusResponseError, StreamUsage } from "@matter/main/types";
 import { CameraAvStreamManagement as Av } from "@matter/main/clusters/camera-av-stream-management";
 import { AUDIO_FORMAT, CameraStreams } from "../camera-streams.mjs";
 import { createCameraAvServer } from "../camera-av-server.mjs";
@@ -102,10 +102,19 @@ test("Matter behavior updates allocation attributes on an offline endpoint", asy
   const node = await ServerNode.create(ServerNode.RootEndpoint.with(TimeServer), { id: "camera-allocation-test" });
   t.after(async () => { await node.close(); await rm(directory, { recursive: true, force: true }); });
   assert.equal(node.stateOf(TimeServer).utcTime, null);
-  await node.act(agent => agent.get(TimeServer).setUtcTime({ utcTime: 1000000n, granularity: 3 }));
+  // matter.js passes epoch-us command fields and attributes as Unix-epoch microseconds.
+  await node.act(agent => agent.get(TimeServer).setUtcTime({
+    utcTime: MATTER_EPOCH_OFFSET_US + 1000000n, granularity: 3 }));
   monotonic = 250000n;
-  assert.equal(node.stateOf(TimeServer).utcTime, 1250000n);
+  assert.equal(node.stateOf(TimeServer).utcTime, MATTER_EPOCH_OFFSET_US + 1250000n);
   assert.equal(node.stateOf(TimeServer).granularity, 2);
+  // The first time zone entry is the Matter epoch, which matter.js holds as Unix microseconds.
+  assert.equal(node.stateOf(TimeServer).timeZone[0].validAt, MATTER_EPOCH_OFFSET_US);
+  await node.act(agent => agent.get(TimeServer).setTimeZone({
+    timeZone: [{ offset: -10800, validAt: MATTER_EPOCH_OFFSET_US, name: "America/Sao_Paulo" }] }));
+  assert.equal(node.stateOf(TimeServer).timeZone[0].offset, -10800);
+  await assert.rejects(node.act(agent => agent.get(TimeServer).setTimeZone({
+    timeZone: [{ offset: 0, validAt: MATTER_EPOCH_OFFSET_US + 1n }] })));
   const streams = new CameraStreams();
   const AvServer = createCameraAvServer(streams, { captureSnapshot: async () => {
     throw new Error("private camera detail");
