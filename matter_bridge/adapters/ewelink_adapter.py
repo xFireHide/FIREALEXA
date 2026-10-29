@@ -29,7 +29,11 @@ from matter_bridge.core.base_adapter import (
 )
 from matter_bridge.crypto.ewelink_crypto import decrypt_payload, encrypt_payload
 from matter_bridge.discovery.network import is_lan_unicast_address
-from matter_bridge.adapters.ewelink_protocol import parse_state_response, successful_response
+from matter_bridge.adapters.ewelink_protocol import (
+    cover_calibrated,
+    parse_state_response,
+    successful_response,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -108,14 +112,21 @@ class EwelinkAdapter(BaseAdapter):
 
     BRAND = "ewelink"
 
-    def __init__(self, apikeys: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        apikeys: dict[str, str] | None = None,
+        names: dict[str, str] | None = None,
+    ) -> None:
         """
         Args:
             apikeys: Mapping of device_id → apikey.
                      Obtained from cloud pairing or eWeLink app database.
+            names: Optional device_id → name given in the eWeLink app, which
+                   takes precedence over the name advertised over mDNS.
         """
         super().__init__()
         self._apikeys: dict[str, str] = apikeys or {}
+        self._names: dict[str, str] = names or {}
         self._zeroconf: AsyncZeroconf | None = None
         self._browser: AsyncServiceBrowser | None = None
         self._http_session: aiohttp.ClientSession | None = None
@@ -133,6 +144,7 @@ class EwelinkAdapter(BaseAdapter):
         """Restore an eWeLink inventory record from the persistent registry."""
         if device.brand != self.BRAND:
             raise ValueError(f"Cannot load {device.brand} record into eWeLink adapter")
+        device.name = self._names.get(device.device_id) or device.name
         self._devices[device.device_id] = device
         self._schedule_poll(device.device_id)
 
@@ -220,7 +232,7 @@ class EwelinkAdapter(BaseAdapter):
                 port=info.port or DEFAULT_PORT,
                 device_type=_UIID_MAP.get(uiid, DeviceType.UNKNOWN),
                 model=f"UIID_{uiid}",
-                name=name.replace(f".{MDNS_SERVICE}", ""),
+                name=self._names.get(device_id) or name.replace(f".{MDNS_SERVICE}", ""),
                 raw_metadata=props,
             )
 
@@ -342,16 +354,27 @@ class EwelinkAdapter(BaseAdapter):
         is_dualr3 = _is_dualr3(device)
         if "cover" in kwargs:
             command = kwargs["cover"]
-            direction = command.get("direction") if isinstance(command, dict) else None
-            if (not is_dualr3 or set(kwargs) != {"cover"} or not isinstance(command, dict)
-                    or set(command) != {"direction"}
-                    or not isinstance(direction, str)
-                    or direction not in {"open", "close", "stop"}):
+            if not is_dualr3 or set(kwargs) != {"cover"} or not isinstance(command, dict):
+                return False
+            direction = command.get("direction")
+            position = command.get("position")
+            if set(command) == {"direction"}:
+                if not isinstance(direction, str) or direction not in {"open", "close", "stop"}:
+                    return False
+                # eWeLink 5.29.1 MotorModeComponent: 1 open, 0 pause, 2 close.
+                motor_turn = {"open": 1, "stop": 0, "close": 2}[direction]
+                path, payload = "motorTurn", {"motorTurn": motor_turn}
+            elif set(command) == {"position"}:
+                if type(position) is not int or not 0 <= position <= 100:
+                    return False
+                # Device-native 0-100 slider value sent by the app's
+                # MotorModeComponent._onSliderConfirm.
+                path, payload = "location", {"location": position}
+            else:
                 return False
             apikey = self._apikeys.get(device_id)
             if not apikey:
                 return False
-            motor_turn = {"open": 1, "stop": 0, "close": 2}[direction]
             lock = self._command_locks.setdefault(device_id, asyncio.Lock())
             async with lock:
                 # Verify motor mode in the same per-device transaction as the
@@ -362,13 +385,13 @@ class EwelinkAdapter(BaseAdapter):
                     self._states[device_id] = state
                     return False
                 params = state.raw.get("params")
-                if not isinstance(params, dict) or params.get("workMode") != 2:
-                    self._states[device_id] = state
-                    return False
                 self._states[device_id] = state
-                result = await self._send_command_locked(
-                    device, "motorTurn", {"motorTurn": motor_turn}, apikey
-                )
+                if not isinstance(params, dict) or params.get("workMode") != 2:
+                    return False
+                # The app refuses position targets until the motor is calibrated.
+                if path == "location" and cover_calibrated(params) is not True:
+                    return False
+                result = await self._send_command_locked(device, path, payload, apikey)
             return successful_response(result)
         uiid = _ewelink_uiid(device)
         is_color_model = uiid in {22, 59}

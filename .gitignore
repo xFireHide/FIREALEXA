@@ -10,3 +10,6 @@ config.json
 matter-bridge.json
 *.registry.json
 *.matter.json
+.firegod-verify.json
+*.egg-info/
+*.bundle

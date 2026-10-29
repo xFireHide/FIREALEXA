@@ -23,6 +23,12 @@ from urllib.parse import unquote, urlsplit
 
 import aiohttp
 
+from matter_bridge.adapters.gwell_protocol import (
+    GWELL_SEARCH_PORT,
+    GwellSearchReply,
+    build_search_request,
+    parse_search_reply,
+)
 from matter_bridge.core.base_adapter import BaseAdapter, DeviceInfo, DeviceState, DeviceType
 from matter_bridge.discovery.network import (
     get_ipv4_broadcast_interfaces,
@@ -423,11 +429,45 @@ class OnvifAdapter(BaseAdapter):
                     queue.put_nowait((data, addr))
 
         transports: list[asyncio.DatagramTransport] = []
+        gwell_transport: asyncio.DatagramTransport | None = None
         found: dict[str, DeviceInfo] = {}
         xm_candidates: set[str] = set()
+        gwell_replies: dict[str, GwellSearchReply] = {}
         interfaces = get_ipv4_broadcast_interfaces()
         local_ips = {local_ip for local_ip, _ in interfaces}
+
+        class GwellProtocol(asyncio.DatagramProtocol):
+            def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+                source_ip = addr[0]
+                if (source_ip in local_ips or not is_lan_unicast_address(source_ip)
+                        or len(gwell_replies) >= MAX_XM_CANDIDATES):
+                    return
+                reply = parse_search_reply(data)
+                if reply is not None:
+                    gwell_replies[source_ip] = reply
+
         try:
+            # Yoosee 6.46.1 receives search replies on its own bound UDP 8899,
+            # not on the request's source port, so listen there as the app does.
+            try:
+                gwell_transport, _ = await loop.create_datagram_endpoint(
+                    GwellProtocol,
+                    local_addr=("0.0.0.0", GWELL_SEARCH_PORT),
+                    family=socket.AF_INET,
+                    allow_broadcast=True,
+                    reuse_port=hasattr(socket, "SO_REUSEPORT"),
+                )
+            except OSError:
+                logger.debug("Could not bind Gwell search port %d", GWELL_SEARCH_PORT,
+                             exc_info=True)
+            else:
+                request = build_search_request()
+                for target in {"255.255.255.255", *(b for _, b in interfaces)}:
+                    try:
+                        gwell_transport.sendto(request, (target, GWELL_SEARCH_PORT))
+                    except OSError:
+                        logger.debug("Could not send Gwell search to %s", target,
+                                     exc_info=True)
             for local_ip, broadcast in interfaces:
                 if not is_lan_unicast_address(local_ip):
                     continue
@@ -557,10 +597,14 @@ class OnvifAdapter(BaseAdapter):
                     logger.debug("Ignoring malformed ONVIF discovery response from %s",
                                  source_ip, exc_info=True)
 
+            for source_ip, reply in sorted(gwell_replies.items())[:MAX_XM_CANDIDATES]:
+                device = await self._record_gwell_reply(source_ip, reply, found)
+                found[device.device_id] = device
+
             # XM replies do not have a documented response parser. Restrict these
             # inferred candidates to hosts that also expose the reported ONVIF and
             # RTSP TCP services; they are still not treated as authenticated.
-            xm_candidates = set(sorted(xm_candidates)[:MAX_XM_CANDIDATES])
+            xm_candidates = set(sorted(xm_candidates - set(gwell_replies))[:MAX_XM_CANDIDATES])
             service_checks = await asyncio.gather(*(
                 asyncio.gather(
                     _tcp_port_accepts_connection(source_ip, 5000),
@@ -608,7 +652,71 @@ class OnvifAdapter(BaseAdapter):
         finally:
             for transport in transports:
                 transport.close()
+            if gwell_transport is not None:
+                gwell_transport.close()
         return list(found.values())
+
+    async def _record_gwell_reply(
+        self, source_ip: str, reply: GwellSearchReply, found: dict[str, DeviceInfo],
+    ) -> DeviceInfo:
+        """Create or annotate a camera found by the Yoosee/Gwell LAN search.
+
+        The reply identifies a Gwell device but grants no control: the official
+        app uses native P2P, not ONVIF. ONVIF is attempted only if the camera
+        also accepts TCP 5000 and configured credentials authenticate.
+        """
+        gwell_metadata = {
+            "gwell_device_id": reply.device_id,
+            "gwell_type": reply.device_type,
+            "gwell_sub_type": reply.sub_type,
+            "gwell_custom_id": reply.custom_id,
+        }
+        existing = next((d for d in found.values() if d.ip == source_ip), None)
+        if existing is not None:
+            existing.raw_metadata.update(gwell_metadata)
+            if reply.mac and not existing.mac:
+                existing.mac = reply.mac
+            return existing
+        onvif_open, rtsp_open = await asyncio.gather(
+            _tcp_port_accepts_connection(source_ip, 5000),
+            _tcp_port_accepts_connection(source_ip, 554),
+        )
+        device_id = f"yoosee-{reply.device_id}"
+        lock = self._ptz_locks.setdefault(device_id, asyncio.Lock())
+        async with lock:
+            device = self._devices.get(device_id)
+            if device is None:
+                device = DeviceInfo(
+                    brand=self.BRAND,
+                    device_id=device_id,
+                    ip=source_ip,
+                    port=5000,
+                    mac=reply.mac or "",
+                    model="Yoosee/Gwell camera",
+                    name=f"Yoosee {reply.device_id}",
+                    device_type=DeviceType.CAMERA,
+                    raw_metadata={},
+                )
+                self._devices[device_id] = device
+            else:
+                if device.ip != source_ip:
+                    self._clear_auth_cache(device)
+                device.ip = source_ip
+                device.port = 5000
+                if reply.mac:
+                    device.mac = reply.mac
+            device.raw_metadata.update({
+                **gwell_metadata,
+                "onvif_scheme": "http",
+                "onvif_service_path": "/onvif/device_service",
+                "discovery_protocol": "gwell_lan_8899",
+                "onvif_port_open": onvif_open,
+                "rtsp_port_open": rtsp_open,
+            })
+            self._last_seen[device_id] = time.monotonic()
+            if onvif_open:
+                self._schedule_poll(device_id)
+        return device
 
     @staticmethod
     def _service_url(device: DeviceInfo) -> str:

@@ -159,7 +159,7 @@ async def run(config_path: Path, discover: bool = True) -> None:
     config_file = config_path.with_name("config.json")
     config = _load_config(config_file)
     unknown = set(config) - {
-        "ewelink_apikeys", "xiaomi_tokens", "broadlink_ir_mappings",
+        "ewelink_apikeys", "ewelink_names", "xiaomi_tokens", "broadlink_ir_mappings",
         "onvif_credentials", "eseecloud_streams", "api_host", "api_port",
         "allow_remote_commands", "matter",
     }
@@ -175,6 +175,12 @@ async def run(config_path: Path, discover: bool = True) -> None:
         raise ValueError(
             "config.json ewelink_apikeys must map non-empty device IDs to non-empty keys"
         )
+    ewelink_names = config.get("ewelink_names", {})
+    if not isinstance(ewelink_names, dict) or not all(
+        isinstance(key, str) and isinstance(value, str) and 0 < len(value) <= 128
+        for key, value in ewelink_names.items()
+    ):
+        raise ValueError("config.json ewelink_names must map device IDs to names of 1-128 chars")
     xiaomi_tokens = config.get("xiaomi_tokens", {})
     if not isinstance(xiaomi_tokens, dict) or not all(
         isinstance(key, str) and isinstance(value, str)
@@ -215,7 +221,7 @@ async def run(config_path: Path, discover: bool = True) -> None:
     if not isinstance(allow_remote, bool):
         raise ValueError("config.json allow_remote_commands must be a boolean")
     adapters = [
-        EwelinkAdapter(apikeys),
+        EwelinkAdapter(apikeys, ewelink_names),
         BroadlinkAdapter(broadlink_ir_mappings),
         XiaomiAdapter(xiaomi_tokens),
         OnvifAdapter(onvif_credentials),
@@ -243,6 +249,7 @@ async def run(config_path: Path, discover: bool = True) -> None:
         port=api_port,
         allow_remote_commands=allow_remote,
         matter_status=lambda: matter.status if matter is not None else "disabled",
+        matter_pairing=matter.pairing_info if matter is not None else None,
     )
     stop_event = asyncio.Event()
     matter_task: asyncio.Task[None] | None = None

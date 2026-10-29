@@ -37,6 +37,22 @@ def successful_response(response: Any) -> bool:
     )
 
 
+def cover_calibrated(params: Any) -> bool | None:
+    """Return the DUALR3 motor calibration flag, or None when it is not reported.
+
+    The eWeLink 5.29.1 app reads ``params.calibState`` and refuses to send a
+    ``/zeroconf/location`` target while it is 0.
+    """
+    if not isinstance(params, dict):
+        return None
+    value = params.get("calibState")
+    if isinstance(value, str) and value.isascii() and value.isdecimal():
+        value = int(value)
+    if type(value) is not int:
+        return None
+    return value != 0
+
+
 def parse_state_response(response: Any) -> DeviceState:
     """Normalize an eWeLink ``info`` reply into the bridge's state model."""
     if not successful_response(response):

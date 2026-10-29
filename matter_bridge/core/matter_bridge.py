@@ -42,10 +42,34 @@ class MatterJsProvider:
         self._recent_output: list[str] = []
         self._ready = asyncio.Event()
         self._status = "starting"
+        self._commissioned: bool | None = None
+        self._manual_code: str | None = None
+        self._qr_payload: str | None = None
 
     @property
     def status(self) -> str:
         return self._status
+
+    def pairing_info(self) -> dict[str, object]:
+        """Return commissioning state and, while unpaired, the pairing codes."""
+        uncommissioned = self._commissioned is False
+        return {
+            "status": self._status,
+            "commissioned": self._commissioned,
+            "manual_pairing_code": self._manual_code if uncommissioned else None,
+            "qr_payload": self._qr_payload if uncommissioned else None,
+        }
+
+    def _note_pairing_output(self, message: str) -> None:
+        # bridge.mjs prints these lines once at startup.
+        if message.startswith("Manual pairing code: "):
+            self._manual_code = message.removeprefix("Manual pairing code: ").strip()
+            self._commissioned = False
+        elif message.startswith("QR Code URL: ") and "data=MT:" in message:
+            self._qr_payload = "MT:" + message.split("data=MT:", 1)[1].strip()
+        elif message.startswith("Matter bridge is commissioned"):
+            self._commissioned = True
+            self._manual_code = self._qr_payload = None
 
     def mark_unavailable(self) -> None:
         """Record a failed start attempt for health reporting and retry loops."""
@@ -60,6 +84,7 @@ class MatterJsProvider:
             self._recent_output.append(message)
             del self._recent_output[:-100]
             logger.info("[matter.js] %s", message)
+            self._note_pairing_output(message)
             if message.startswith("FIREALEXA Matter bridge started"):
                 self._ready.set()
 

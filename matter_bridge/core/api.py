@@ -15,6 +15,7 @@ from aiohttp import web
 
 from matter_bridge.core.base_adapter import BaseAdapter, DeviceInfo, DeviceState
 from matter_bridge.core.registry import DeviceRegistry
+from matter_bridge.adapters.ewelink_protocol import cover_calibrated
 from matter_bridge.adapters.onvif_adapter import OnvifAdapter
 from matter_bridge.adapters.eseecloud_adapter import (
     EseeCloudAdapter,
@@ -123,6 +124,9 @@ def _device_json(device: DeviceInfo, state: DeviceState | None) -> dict[str, Any
                 if state.cover_motion in {"opening", "closing", "stopped"}
                 else None
             ),
+            "cover_calibrated": (
+                cover_calibrated(params) if _is_dualr3(device) else None
+            ),
             "contact_open": _optional_bool(state.contact_open),
             "motion_detected": _optional_bool(state.motion_detected),
             "raw": state.raw,
@@ -130,7 +134,7 @@ def _device_json(device: DeviceInfo, state: DeviceState | None) -> dict[str, Any
     }
     if device.brand == "onvif":
         discovery_protocol = device.raw_metadata.get("discovery_protocol")
-        if discovery_protocol not in {"onvif_ws_discovery", "xm_udp_8899"}:
+        if discovery_protocol not in {"onvif_ws_discovery", "xm_udp_8899", "gwell_lan_8899"}:
             discovery_protocol = None
         vendor_hint = (
             "Yoosee/XM (unverified)"
@@ -138,17 +142,32 @@ def _device_json(device: DeviceInfo, state: DeviceState | None) -> dict[str, Any
             and device.raw_metadata.get("vendor_hint") == "Yoosee/XM (unverified)"
             else None
         )
+        gwell_id = device.raw_metadata.get("gwell_device_id")
         result["camera"] = _json_safe({
             "authenticated": device.raw_metadata.get("onvif_authenticated") is True,
             "profiles": device.raw_metadata.get("onvif_profiles", []),
             "discovery_protocol": discovery_protocol,
             "vendor_hint": vendor_hint,
+            "gwell": {
+                "device_id": gwell_id,
+                "type": device.raw_metadata.get("gwell_type"),
+                "sub_type": device.raw_metadata.get("gwell_sub_type"),
+                "onvif_port_open": device.raw_metadata.get("onvif_port_open"),
+            } if type(gwell_id) is int else None,
         })
     elif device.brand == "eseecloud":
         result["camera"] = _json_safe({
             "stream_channel": device.raw_metadata.get("stream_channel"),
             "discovery_protocol": device.raw_metadata.get("discovery_protocol"),
-            "stream_available": state.online if state is not None else False,
+            "stream_available": (
+                state.raw.get("stream_available") is True if state is not None else False
+            ),
+            "lan_discovery": {
+                "device_id": device.raw_metadata.get("eseecloud_device_id"),
+                "device_type": device.raw_metadata.get("eseecloud_device_type"),
+                "version": device.raw_metadata.get("eseecloud_version"),
+                "max_channel": device.raw_metadata.get("eseecloud_max_channel"),
+            } if isinstance(device.raw_metadata.get("eseecloud_device_id"), str) else None,
         })
     return result
 
@@ -174,12 +193,14 @@ class LocalAPI:
         port: int = 8765,
         allow_remote_commands: bool = False,
         matter_status: Callable[[], str] | None = None,
+        matter_pairing: Callable[[], dict[str, object]] | None = None,
     ) -> None:
         self.registry = registry
         self.adapters = {adapter.BRAND: adapter for adapter in adapters}
         self.host, self.port = host, port
         self.allow_remote_commands = allow_remote_commands
         self.matter_status = matter_status
+        self.matter_pairing = matter_pairing
         self._runner: web.AppRunner | None = None
         self._lifecycle_lock = asyncio.Lock()
 
@@ -322,6 +343,8 @@ class LocalAPI:
         adapter = self.adapters.get("eseecloud")
         if not isinstance(adapter, EseeCloudAdapter):
             raise web.HTTPNotFound(text="EseeCloud stream adapter is unavailable")
+        if not adapter.has_stream(device_id):
+            raise web.HTTPNotFound(text="No local stream is configured for this EseeCloud camera")
         downstream = web.StreamResponse(headers={
             "Content-Type": "application/octet-stream",
             "Cache-Control": "no-store",
@@ -387,6 +410,8 @@ class LocalAPI:
         adapter = self.adapters.get("eseecloud")
         if not isinstance(adapter, EseeCloudAdapter):
             raise web.HTTPNotFound(text="EseeCloud stream adapter is unavailable")
+        if not adapter.has_stream(device_id):
+            raise web.HTTPNotFound(text="No local stream is configured for this EseeCloud camera")
         try:
             async with adapter.stream(device_id) as upstream:
                 media = EseeCloudMediaReader(upstream.content)
@@ -498,12 +523,20 @@ class LocalAPI:
         if "cover" in payload:
             command = payload["cover"]
             direction = command.get("direction") if isinstance(command, dict) else None
+            position = command.get("position") if isinstance(command, dict) else None
+            valid_direction = (
+                isinstance(command, dict) and set(command) == {"direction"}
+                and isinstance(direction, str) and direction in {"open", "close", "stop"}
+            )
+            valid_position = (
+                isinstance(command, dict) and set(command) == {"position"}
+                and type(position) is int and 0 <= position <= 100
+            )
             if (brand != "ewelink" or set(payload) != {"cover"}
-                    or not isinstance(command, dict) or set(command) != {"direction"}
-                    or not isinstance(direction, str)
-                    or direction not in {"open", "close", "stop"}):
+                    or not (valid_direction or valid_position)):
                 raise web.HTTPBadRequest(
                     text="cover must be an eWeLink command with direction open, close, or stop"
+                    " or an integer position from 0 to 100"
                 )
 
         fields = set(payload)
@@ -526,6 +559,10 @@ class LocalAPI:
                 if not is_dualr3 or not isinstance(params, dict) or params.get("workMode") != 2:
                     raise web.HTTPConflict(
                         text="DUALR3 cover commands require confirmed motor mode"
+                    )
+                if "position" in payload["cover"] and cover_calibrated(params) is not True:
+                    raise web.HTTPConflict(
+                        text="DUALR3 position commands require a calibrated motor"
                     )
             if "on" in fields and device_type not in {
                 "ON_OFF_PLUG", "ON_OFF_LIGHT", "DIMMABLE_LIGHT", "COLOR_LIGHT", "THERMOSTAT",
@@ -613,6 +650,10 @@ class LocalAPI:
                         text=f"DUALR3 control requires confirmed {mode_name} mode"
                     )
                 if "cover" in fields:
+                    if "position" in payload["cover"] and cover_calibrated(params) is not True:
+                        raise web.HTTPConflict(
+                            text="DUALR3 position commands require a calibrated motor"
+                        )
                     raise web.HTTPBadGateway(text="DUALR3 motor command was not confirmed")
                 switches = state.raw.get("switches")
                 if not isinstance(switches, list) or not any(
@@ -625,6 +666,15 @@ class LocalAPI:
             raise web.HTTPBadGateway(text="Device did not confirm the command")
         await self._refresh_state(adapter, device_id)
         return web.json_response({"ok": True, "device_id": device_id})
+
+    async def get_matter_pairing(self, request: web.Request) -> web.Response:
+        """Return Matter pairing codes to loopback clients while unpaired."""
+        self._check_loopback_origin(request)
+        if self.matter_pairing is None:
+            raise web.HTTPNotFound(text="Matter is disabled")
+        return web.json_response(
+            self.matter_pairing(), headers={"Cache-Control": "no-store"},
+        )
 
     async def learn_ir(self, request: web.Request) -> web.Response:
         self._check_command_origin(request)
@@ -656,6 +706,7 @@ class LocalAPI:
             app = web.Application(client_max_size=1024 * 1024)
             app.add_routes([
                 web.get("/health", self.health),
+                web.get("/api/matter/pairing", self.get_matter_pairing),
                 web.get("/api/devices", self.list_devices),
                 web.get("/api/devices/{brand}/{device_id}", self.get_state),
                 web.get(
