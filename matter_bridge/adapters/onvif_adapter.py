@@ -19,7 +19,7 @@ import uuid
 from collections.abc import Callable
 from datetime import datetime, timezone
 import xml.etree.ElementTree as ET
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 import aiohttp
 
@@ -192,6 +192,50 @@ class OnvifAdapter(BaseAdapter):
 
     def has_credentials(self, device_id: str) -> bool:
         return device_id in self._credentials
+
+    def media_source(self, device_id: str, profile_token: str) -> dict[str, str | bool]:
+        """Private IPC source; never serialize this value through the HTTP API."""
+        device = self.devices.get(device_id)
+        credentials = self._credentials.get(device_id)
+        if (device is None or credentials is None
+                or device.raw_metadata.get("onvif_authenticated") is not True):
+            raise ValueError("Authenticated ONVIF camera is required")
+        profile = self._profile_by_selector(device_id, profile_token)
+        uri = profile.get("rtsp_uri") if profile else None
+        safe = self._sanitize_rtsp_uri(uri, device.ip) if isinstance(uri, str) else None
+        if safe is None or not safe.startswith("rtsp://"):
+            raise ValueError("A discovered RTSP profile is required")
+        parsed = urlsplit(safe)
+        user = quote(credentials["username"], safe="")
+        password = quote(credentials["password"], safe="")
+        return {"uri": f"rtsp://{user}:{password}@{parsed.netloc}{parsed.path}",
+                "ip": device.ip, "audio": profile.get("audio") is True}
+
+    def public_profiles(self, device_id: str) -> list[dict[str, str | bool]]:
+        """Return stable opaque profile selectors, never ONVIF credentials or URIs."""
+        if self.devices.get(device_id) is None:
+            return []
+        return [{
+            "id": hashlib.sha256(str(profile["token"]).encode()).hexdigest()[:24],
+            "audio": profile.get("audio") is True,
+            "ptz": profile.get("ptz") is True,
+            "video_available": (
+                isinstance(profile.get("rtsp_uri"), str)
+                and urlsplit(str(profile["rtsp_uri"])).scheme == "rtsp"
+            ),
+        } for profile in self._profiles.get(device_id, [])]
+
+    def _profile_by_selector(self, device_id: str, selector: str) -> dict[str, str | bool] | None:
+        return next((profile for profile in self._profiles.get(device_id, [])
+                     if profile.get("token") == selector or
+                     hashlib.sha256(str(profile.get("token", "")).encode()).hexdigest()[:24]
+                     == selector), None)
+
+    def resolve_profile_selector(self, device_id: str, selector: str) -> str | None:
+        """Map a public opaque profile selector to its current authenticated profile."""
+        profile = self._profile_by_selector(device_id, selector)
+        token = profile.get("token") if profile else None
+        return token if isinstance(token, str) else None
 
     def supports_ptz(self, device_id: str) -> bool:
         return (
@@ -894,7 +938,8 @@ class OnvifAdapter(BaseAdapter):
             if not token or len(token) > 256:
                 continue
             has_ptz = any(_local_name(child.tag) == "PTZConfiguration" for child in element)
-            profiles.append({"token": token, "ptz": has_ptz})
+            has_audio = any(_local_name(child.tag) == "AudioEncoderConfiguration" for child in element)
+            profiles.append({"token": token, "ptz": has_ptz, "audio": has_audio})
             if len(profiles) >= MAX_PROFILES:
                 break
         return profiles

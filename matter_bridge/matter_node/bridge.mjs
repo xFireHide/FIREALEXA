@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { join } from "node:path";
 import { Endpoint, ServerNode, VendorId } from "@matter/main";
 import { QrCode } from "@matter/main/types";
 import { BridgedDeviceBasicInformationServer } from "@matter/main/behaviors/bridged-device-basic-information";
@@ -17,6 +18,22 @@ import { OnOffServer } from "@matter/main/behaviors/on-off";
 import { LevelControlServer } from "@matter/main/behaviors/level-control";
 import { ColorControlServer } from "@matter/main/behaviors/color-control";
 import { AggregatorEndpoint } from "@matter/main/endpoints/aggregator";
+import { CameraDevice } from "@matter/main/devices/camera";
+import { CameraAvStreamManagement } from "@matter/main/clusters/camera-av-stream-management";
+import { StreamUsage } from "@matter/main/types";
+import { FabricManager } from "@matter/protocol";
+import { TimeSynchronizationClient } from "@matter/main/behaviors/time-synchronization";
+import { TlsCertificateManagementServer } from "@matter/main/behaviors/tls-certificate-management";
+import { TlsClientManagementServer } from "@matter/main/behaviors/tls-client-management";
+import { PowerSourceEndpoint } from "@matter/main/endpoints/power-source";
+import { PowerSourceServer } from "@matter/main/behaviors/power-source";
+import { createCameraTimeServer, loadCameraClock } from "./camera-time.mjs";
+import { createCameraAvServer } from "./camera-av-server.mjs";
+import { createCameraBackend } from "./camera-backend.mjs";
+import { createMatterCameraSignalSender, createCameraProviderServer } from "./camera-provider-server.mjs";
+import { createOnvifSnapshotCapture } from "./camera-snapshot.mjs";
+import { CameraStreams } from "./camera-streams.mjs";
+import { CameraTransport } from "./camera-transport.mjs";
 
 const apiUrl = process.env.FIREALEXA_API_URL ?? "http://127.0.0.1:8765";
 const nodeId = process.env.FIREALEXA_MATTER_NODE_ID ?? "firealexa-bridge";
@@ -41,7 +58,17 @@ for (const [name, value] of [["port", port], ["vendor ID", vendorId], ["product 
   }
 }
 
-const server = await ServerNode.create({
+const clockPath = process.env.FIREALEXA_MATTER_TIME_FILE ??
+  join(process.env.MATTER_STORAGE_PATH ?? "./storage", "matter-time.json");
+const endpoints = new Map();
+let server;
+const CameraTimeServer = createCameraTimeServer(await loadCameraClock(clockPath), () => server);
+const RootEndpoint = ServerNode.RootEndpoint.with(
+  CameraTimeServer,
+  TlsCertificateManagementServer,
+  TlsClientManagementServer,
+).withClientClusters(TimeSynchronizationClient);
+server = await ServerNode.create(RootEndpoint, {
   id: nodeId,
   network: { port },
   commissioning: { passcode, discriminator },
@@ -60,10 +87,18 @@ const server = await ServerNode.create({
     uniqueId: nodeId,
   },
 });
+server.env.get(FabricManager).events.deleting.on(async fabric => {
+  const transports = [...endpoints.values()]
+    .filter(record => record.capability === "matterCamera")
+    .map(record => record.transport);
+  await Promise.all(transports.map(transport => transport.closeFabric(fabric.fabricIndex)));
+  await server.act(agent => agent.get(CameraTimeServer).removeFabric(fabric.fabricIndex));
+});
 const aggregator = new Endpoint(AggregatorEndpoint, { id: "aggregator" });
 await server.add(aggregator);
 
-const endpoints = new Map();
+const sendCameraSignal = createMatterCameraSignalSender(server);
+let cameraPowerEndpoint;
 const PENDING_STATE_TTL_MS = 30_000;
 const identity = (device) => `${device.brand}:${device.device_id}`;
 const endpointId = (key) => `dev-${createHash("sha256").update(key).digest("hex").slice(0, 20)}`;
@@ -428,6 +463,13 @@ async function addDevice(device) {
     available.push({ key: `${baseKey}:motion`, kind: CameraMotionSensorDevice,
       capability: "cameraMotion" });
   }
+  if (device.brand === "onvif" && device.type === "CAMERA" &&
+      device.camera?.authenticated === true && Array.isArray(device.camera.profiles)) {
+    const profile = device.camera.profiles.find(item => item && typeof item.id === "string" &&
+      item.id.length === 24 && item.audio === true && item.video_available === true);
+    if (profile) available.push({ key: `${baseKey}:matter-camera`, kind: CameraDevice,
+      capability: "matterCamera", profile });
+  }
   if (device.type === "THERMOSTAT") {
     if (hasTemperatureSample(device)) {
       available.push({ key: `${baseKey}:temperature`, kind: TemperatureSensorDevice,
@@ -462,6 +504,61 @@ async function addDevice(device) {
   for (const item of available) {
     if (endpoints.has(item.key)) continue;
     try {
+      if (item.capability === "matterCamera") {
+        const streams = new CameraStreams({ audio: true });
+        const captureSnapshot = createOnvifSnapshotCapture(apiUrl, device.device_id, item.profile.id);
+        const AvServer = createCameraAvServer(streams, { captureSnapshot });
+        const transport = new CameraTransport(streams,
+          createCameraBackend(apiUrl, device.device_id, item.profile.id), {
+            onPeerEnd: (owner, signal) => sendCameraSignal(owner, { ...signal, command: "end" }),
+          });
+        const Provider = createCameraProviderServer(transport, AvServer, sendCameraSignal);
+        const endpoint = new Endpoint(item.kind.with(AvServer, Provider), {
+          id: endpointId(item.key),
+          bridgedDeviceBasicInformation: {
+            nodeLabel: matterText(name), productName: matterText(device.model || name),
+            productLabel: matterText(name, 64),
+            serialNumber: createHash("sha256").update(item.key).digest("hex").slice(0, 32),
+            reachable: device.online === true,
+          },
+          cameraAvStreamManagement: {
+            maxContentBufferSize: 0, maxNetworkBandwidth: 2_000_000,
+            supportedStreamUsages: [StreamUsage.LiveView],
+            streamUsagePriorities: [StreamUsage.LiveView],
+            maxConcurrentEncoders: 2, maxEncodedPixelRate: 13_824_000,
+            videoSensorParams: { sensorWidth: 640, sensorHeight: 360, maxFps: 30 },
+            minViewportResolution: { width: 640, height: 360 },
+            rateDistortionTradeOffPoints: [{ codec: CameraAvStreamManagement.VideoCodec.H264,
+              resolution: { width: 640, height: 360 }, minBitRate: 600_000 }],
+            currentFrameRate: 30, viewport: { x1: 0, y1: 0, x2: 640, y2: 360 },
+            snapshotCapabilities: [{ resolution: { width: 640, height: 360 }, maxFrameRate: 1,
+              imageCodec: CameraAvStreamManagement.ImageCodec.Jpeg,
+              requiresEncodedPixels: true, requiresHardwareEncoder: false }],
+          },
+        });
+        try {
+          await aggregator.add(endpoint);
+          endpoints.set(item.key, { endpoint, device, capability: item.capability,
+            profileId: item.profile.id, transport });
+          if (!cameraPowerEndpoint) {
+            cameraPowerEndpoint = new Endpoint(PowerSourceEndpoint.with(
+              PowerSourceServer.with("Wired")), { id: "camera-power" });
+            await aggregator.add(cameraPowerEndpoint);
+          }
+        } catch (error) {
+          endpoints.delete(item.key);
+          await transport.close();
+          await endpoint.close().catch(() => {});
+          if (cameraPowerEndpoint && ![...endpoints.values()].some(record =>
+            record.capability === "matterCamera")) {
+            await cameraPowerEndpoint.close().catch(() => {});
+            cameraPowerEndpoint = undefined;
+          }
+          throw error;
+        }
+        console.info(`Added Matter camera endpoint ${name} (${item.key})`);
+        continue;
+      }
       let record;
       const writeState = async (state) => {
         const previous = record.pendingCommand;
@@ -703,6 +800,11 @@ async function synchronize() {
             ? type === "MOTION_SENSOR"
           : record.capability === "cameraMotion"
             ? type === "CAMERA"
+          : record.capability === "matterCamera"
+            ? type === "CAMERA" && device.brand === "onvif" &&
+              device.camera?.authenticated === true &&
+              device.camera.profiles?.some(profile => profile.id === record.profileId &&
+                profile.audio === true && profile.video_available === true)
           : record.capability === "cover"
             ? type === "WINDOW_COVERING" && device.uiid === 126
             : record.capability === "temperature"
@@ -716,6 +818,7 @@ async function synchronize() {
       if (supported) continue;
     }
     try {
+      await record.transport?.close();
       await record.endpoint.close();
       endpoints.delete(key);
       console.info(`Removed Matter endpoint for unregistered device ${key}`);
@@ -753,6 +856,7 @@ async function shutdown() {
   if (closing) return;
   closing = true;
   clearTimeout(syncTimer);
+  await Promise.all([...endpoints.values()].map(record => record.transport?.close()));
   await server.close();
   process.exit(0);
 }

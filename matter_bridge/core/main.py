@@ -243,6 +243,7 @@ async def run(config_path: Path, discover: bool = True) -> None:
         port=api_port,
         allow_remote_commands=allow_remote,
         matter_status=lambda: matter.status if matter is not None else "disabled",
+        camera_runtime_path=config_file.parent / "matter-storage" / "runtime",
     )
     stop_event = asyncio.Event()
     matter_task: asyncio.Task[None] | None = None

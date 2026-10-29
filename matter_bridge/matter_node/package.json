@@ -2,6 +2,12 @@
   "name": "firealexa-matter-bridge",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=22.13.0" },
-  "dependencies": { "@matter/main": "0.18.0" }
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "dependencies": {
+    "@matter/main": "0.18.0",
+    "@matter/protocol": "0.18.0",
+    "werift": "0.25.2"
+  }
 }

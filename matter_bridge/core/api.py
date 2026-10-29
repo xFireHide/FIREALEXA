@@ -9,12 +9,15 @@ import math
 from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
+from urllib.parse import urlsplit
+from pathlib import Path
 
 import aiohttp
 from aiohttp import web
 
 from matter_bridge.core.base_adapter import BaseAdapter, DeviceInfo, DeviceState
 from matter_bridge.core.registry import DeviceRegistry
+from matter_bridge.core.camera_media import CameraMedia, CameraMediaBusy
 from matter_bridge.adapters.onvif_adapter import OnvifAdapter
 from matter_bridge.adapters.eseecloud_adapter import (
     EseeCloudAdapter,
@@ -94,7 +97,11 @@ def _ewelink_uiid(device: DeviceInfo) -> int | None:
     return None
 
 
-def _device_json(device: DeviceInfo, state: DeviceState | None) -> dict[str, Any]:
+def _device_json(
+    device: DeviceInfo,
+    state: DeviceState | None,
+    adapter: BaseAdapter | None = None,
+) -> dict[str, Any]:
     device_type = device.device_type.name
     params = state.raw.get("params") if state is not None else None
     if _is_dualr3(device) and isinstance(params, dict) and params.get("workMode") == 2:
@@ -140,7 +147,11 @@ def _device_json(device: DeviceInfo, state: DeviceState | None) -> dict[str, Any
         )
         result["camera"] = _json_safe({
             "authenticated": device.raw_metadata.get("onvif_authenticated") is True,
-            "profiles": device.raw_metadata.get("onvif_profiles", []),
+            "profiles": (
+                adapter.public_profiles(device.device_id)
+                if isinstance(adapter, OnvifAdapter)
+                and device.raw_metadata.get("onvif_authenticated") is True else []
+            ),
             "discovery_protocol": discovery_protocol,
             "vendor_hint": vendor_hint,
         })
@@ -174,6 +185,7 @@ class LocalAPI:
         port: int = 8765,
         allow_remote_commands: bool = False,
         matter_status: Callable[[], str] | None = None,
+        camera_runtime_path: Path | None = None,
     ) -> None:
         self.registry = registry
         self.adapters = {adapter.BRAND: adapter for adapter in adapters}
@@ -182,6 +194,115 @@ class LocalAPI:
         self.matter_status = matter_status
         self._runner: web.AppRunner | None = None
         self._lifecycle_lock = asyncio.Lock()
+        self._camera_runtime_path = camera_runtime_path
+        self._camera_media = CameraMedia(camera_runtime_path)
+
+    def _check_camera_client(self, request: web.Request) -> None:
+        self._check_loopback_origin(request)
+        # Defend the localhost signaling service against DNS rebinding and
+        # cross-origin browser requests, even when remote device control is enabled.
+        try:
+            host = urlsplit(f"http://{request.host}").hostname
+            allowed = host == "localhost" or ipaddress.ip_address(host).is_loopback
+        except (ValueError, TypeError):
+            allowed = False
+        if not allowed:
+            raise web.HTTPForbidden(text="Camera signaling requires a loopback Host")
+        origin = request.headers.get("Origin")
+        if origin is not None and origin != f"{request.scheme}://{request.host}":
+            raise web.HTTPForbidden(text="Cross-origin camera signaling is forbidden")
+
+    async def create_camera_session(self, request: web.Request) -> web.Response:
+        self._check_camera_client(request)
+        if request.content_type != "application/json":
+            raise web.HTTPUnsupportedMediaType(text="JSON signaling is required")
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            raise web.HTTPBadRequest(text="Invalid JSON") from None
+        if (not isinstance(body, dict) or "profile" not in body or set(body) - {"profile", "sdp", "audio"}
+                or not isinstance(body["profile"], str) or not 1 <= len(body["profile"]) <= 256
+                or ("audio" in body and not isinstance(body["audio"], bool))
+                or ("sdp" in body and (not isinstance(body["sdp"], str)
+                    or not 1 <= len(body["sdp"].encode()) <= 65536))):
+            raise web.HTTPBadRequest(text="A profile and optional SDP offer are required")
+        adapter = self.adapters.get("onvif")
+        if not isinstance(adapter, OnvifAdapter):
+            raise web.HTTPNotFound(text="No ONVIF adapter is available")
+        device_id = request.match_info["device_id"]
+        if self._device("onvif", device_id) is None:
+            raise web.HTTPNotFound(text="Unknown ONVIF camera")
+        try:
+            source = adapter.media_source(device_id, body["profile"])
+        except (ValueError, KeyError):
+            raise web.HTTPConflict(text="An authenticated RTSP profile is required") from None
+        if body.get("audio") is True and source.get("audio") is not True:
+            raise web.HTTPConflict(text="This ONVIF profile does not advertise audio")
+        if "audio" in body:
+            source["audio"] = body["audio"]
+        try:
+            result = await self._camera_media.create(source, body.get("sdp"))
+        except CameraMediaBusy:
+            raise web.HTTPTooManyRequests(text="Camera session limit reached") from None
+        except (RuntimeError, OSError):
+            raise web.HTTPBadGateway(text="Camera video negotiation failed") from None
+        return web.json_response(result, status=201, headers={"Cache-Control": "no-store"})
+
+    async def camera_ice(self, request: web.Request) -> web.Response:
+        self._check_camera_client(request)
+        if request.content_type != "application/json":
+            raise web.HTTPUnsupportedMediaType(text="JSON signaling is required")
+        try:
+            body = await request.json()
+            if not isinstance(body, dict) or set(body) != {"candidate"}:
+                raise ValueError()
+            candidate = body["candidate"]
+            if candidate is not None and (
+                not isinstance(candidate, dict)
+                or set(candidate) - {"candidate", "sdpMid", "sdpMLineIndex", "usernameFragment"}
+                or not isinstance(candidate.get("candidate"), str)
+                or len(str(candidate)) > 4096
+            ):
+                raise ValueError()
+        except (ValueError, TypeError):
+            raise web.HTTPBadRequest(text="Invalid ICE candidate") from None
+        try:
+            await self._camera_media.ice(request.match_info["session_id"], candidate)
+        except KeyError:
+            raise web.HTTPNotFound(text="Unknown camera session") from None
+        except RuntimeError:
+            raise web.HTTPBadGateway(text="Camera ICE exchange failed") from None
+        return web.Response(status=204)
+
+    async def close_camera_session(self, request: web.Request) -> web.Response:
+        self._check_camera_client(request)
+        await self._camera_media.close(request.match_info["session_id"])
+        return web.Response(status=204)
+
+    async def camera_session_status(self, request: web.Request) -> web.Response:
+        self._check_camera_client(request)
+        active = self._camera_media.is_active(request.match_info["session_id"])
+        return web.json_response({"active": active}, headers={"Cache-Control": "no-store"})
+
+    async def camera_answer(self, request: web.Request) -> web.Response:
+        self._check_camera_client(request)
+        if request.content_type != "application/json":
+            raise web.HTTPUnsupportedMediaType(text="JSON signaling is required")
+        try:
+            body = await request.json()
+            if (not isinstance(body, dict) or set(body) != {"sdp"}
+                    or not isinstance(body["sdp"], str)
+                    or not 1 <= len(body["sdp"].encode()) <= 65536):
+                raise ValueError()
+        except (ValueError, TypeError):
+            raise web.HTTPBadRequest(text="Invalid SDP answer") from None
+        try:
+            await self._camera_media.answer(request.match_info["session_id"], body["sdp"])
+        except KeyError:
+            raise web.HTTPNotFound(text="Unknown camera session") from None
+        except RuntimeError:
+            raise web.HTTPBadGateway(text="Camera SDP exchange failed") from None
+        return web.Response(status=204)
 
     def _adapter(self, device: DeviceInfo) -> BaseAdapter:
         try:
@@ -262,7 +383,7 @@ class LocalAPI:
             state = adapter.get_cached_state(device.device_id)
             if device.raw_metadata.get("virtual_ir") is True:
                 state = await self._refresh_state(adapter, device.device_id)
-            result.append(_device_json(device, state))
+            result.append(_device_json(device, state, adapter))
         return web.json_response(result)
 
     async def get_state(self, request: web.Request) -> web.Response:
@@ -270,8 +391,9 @@ class LocalAPI:
         device = self._device(brand, device_id)
         if device is None:
             raise web.HTTPNotFound(text="Unknown device")
-        state = await self._refresh_state(self._adapter(device), device_id)
-        return web.json_response(_device_json(device, state))
+        adapter = self._adapter(device)
+        state = await self._refresh_state(adapter, device_id)
+        return web.json_response(_device_json(device, state, adapter))
 
     async def get_camera_snapshot(self, request: web.Request) -> web.Response:
         self._check_loopback_origin(request)
@@ -291,14 +413,11 @@ class LocalAPI:
         if (not adapter.has_credentials(device_id)
                 or device.raw_metadata.get("onvif_authenticated") is not True):
             raise web.HTTPConflict(text="Configure valid local ONVIF credentials first")
-        profiles = device.raw_metadata.get("onvif_profiles", [])
-        if not isinstance(profiles, list) or not any(
-            isinstance(profile, dict) and profile.get("token") == profile_token
-            for profile in profiles
-        ):
+        resolved_profile = adapter.resolve_profile_selector(device_id, profile_token)
+        if resolved_profile is None:
             raise web.HTTPNotFound(text="Unknown ONVIF media profile")
         try:
-            image = await adapter.get_snapshot(device_id, profile_token)
+            image = await adapter.get_snapshot(device_id, resolved_profile)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -653,10 +772,17 @@ class LocalAPI:
         async with self._lifecycle_lock:
             if self._runner is not None:
                 raise RuntimeError("Local API server is already running")
+            if self._camera_media._stopping:
+                self._camera_media = CameraMedia(self._camera_runtime_path)
             app = web.Application(client_max_size=1024 * 1024)
             app.add_routes([
                 web.get("/health", self.health),
                 web.get("/api/devices", self.list_devices),
+                web.post("/api/devices/onvif/{device_id}/sessions", self.create_camera_session),
+                web.post("/api/camera-sessions/{session_id}/ice", self.camera_ice),
+                web.post("/api/camera-sessions/{session_id}/answer", self.camera_answer),
+                web.get("/api/camera-sessions/{session_id}", self.camera_session_status),
+                web.delete("/api/camera-sessions/{session_id}", self.close_camera_session),
                 web.get("/api/devices/{brand}/{device_id}", self.get_state),
                 web.get(
                     "/api/devices/{brand}/{device_id}/snapshot",
@@ -692,6 +818,7 @@ class LocalAPI:
 
     async def stop(self) -> None:
         async with self._lifecycle_lock:
+            await self._camera_media.stop()
             runner = self._runner
             if runner is None:
                 return
