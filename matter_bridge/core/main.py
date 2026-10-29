@@ -276,7 +276,9 @@ async def run(config_path: Path, discover: bool = True) -> None:
                 for device in result:
                     should_authenticate = (
                         device.brand == "broadlink"
-                        or device.brand == "eseecloud"
+                        or (device.brand == "eseecloud"
+                            and device.raw_metadata.get("discovery_protocol")
+                            != "eseecloud_lan_nvr")
                         or (device.brand == "xiaomi" and bool(device.auth_token))
                         or (device.brand == "ewelink" and device.device_id in apikeys)
                         or (isinstance(adapter, OnvifAdapter)
