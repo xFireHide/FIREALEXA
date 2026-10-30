@@ -25,7 +25,7 @@ dev = [
 matter-bridge = "matter_bridge.core.main:main"
 
 [tool.setuptools.package-data]
-matter_bridge = ["matter_node/*.mjs", "matter_node/package.json", "matter_node/package-lock.json"]
+matter_bridge = ["matter_node/*.mjs", "matter_node/package.json", "matter_node/package-lock.json", "web/*.html"]
 
 [tool.setuptools.packages.find]
 include = ["matter_bridge*"]

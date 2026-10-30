@@ -251,6 +251,7 @@ async def run(config_path: Path, discover: bool = True) -> None:
         matter_status=lambda: matter.status if matter is not None else "disabled",
         matter_pairing=matter.pairing_info if matter is not None else None,
         camera_runtime_path=config_file.parent / "matter-storage" / "runtime",
+        yoosee_session_path=config_file.parent / "matter-storage" / "yoosee-session.json",
     )
     stop_event = asyncio.Event()
     matter_task: asyncio.Task[None] | None = None

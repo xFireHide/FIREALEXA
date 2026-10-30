@@ -28,6 +28,7 @@ from matter_bridge.adapters.eseecloud_protocol import (
     EseeCloudMediaReader,
     EseeCloudProtocolError,
 )
+from matter_bridge.adapters.yoosee_cloud import YooseeCloud, YooseeCloudError
 
 logger = logging.getLogger(__name__)
 
@@ -206,6 +207,7 @@ class LocalAPI:
         matter_status: Callable[[], str] | None = None,
         matter_pairing: Callable[[], dict[str, object]] | None = None,
         camera_runtime_path: Path | None = None,
+        yoosee_session_path: Path | None = None,
     ) -> None:
         self.registry = registry
         self.adapters = {adapter.BRAND: adapter for adapter in adapters}
@@ -217,6 +219,59 @@ class LocalAPI:
         self._lifecycle_lock = asyncio.Lock()
         self._camera_runtime_path = camera_runtime_path
         self._camera_media = CameraMedia(camera_runtime_path)
+        self._yoosee = YooseeCloud(yoosee_session_path)
+
+    async def yoosee_status(self, request: web.Request) -> web.Response:
+        self._check_camera_client(request)
+        return web.json_response(self._yoosee.public_status(), headers={"Cache-Control": "no-store"})
+
+    async def yoosee_login(self, request: web.Request) -> web.Response:
+        self._check_camera_client(request)
+        if request.content_type != "application/json":
+            raise web.HTTPUnsupportedMediaType(text="JSON é obrigatório")
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            raise web.HTTPBadRequest(text="JSON inválido") from None
+        if (
+            not isinstance(body, dict)
+            or set(body) - {"account", "password", "login_region", "mode", "mobile_area"}
+            or not all(
+                isinstance(body.get(field), str)
+                for field in ("account", "password", "login_region")
+            )
+            or ("mode" in body and not isinstance(body["mode"], str))
+            or ("mobile_area" in body and not isinstance(body["mobile_area"], str))
+        ):
+            raise web.HTTPBadRequest(text="Informe account, password e login_region")
+        try:
+            status = await self._yoosee.login(
+                account=body["account"], password=body["password"],
+                login_region=body["login_region"], mode=body.get("mode", "email"),
+                mobile_area=body.get("mobile_area", ""),
+            )
+        except YooseeCloudError as exc:
+            raise web.HTTPBadGateway(text=str(exc)) from None
+        except Exception:
+            logger.warning("Yoosee login failed", exc_info=True)
+            raise web.HTTPBadGateway(text="Falha ao entrar na conta Yoosee") from None
+        return web.json_response(status, headers={"Cache-Control": "no-store"})
+
+    async def yoosee_devices(self, request: web.Request) -> web.Response:
+        self._check_camera_client(request)
+        try:
+            devices = await self._yoosee.devices()
+        except YooseeCloudError as exc:
+            raise web.HTTPBadGateway(text=str(exc)) from None
+        except Exception:
+            logger.warning("Yoosee device listing failed", exc_info=True)
+            raise web.HTTPBadGateway(text="Falha ao listar dispositivos Yoosee") from None
+        return web.json_response(devices, headers={"Cache-Control": "no-store"})
+
+    async def yoosee_logout(self, request: web.Request) -> web.Response:
+        self._check_camera_client(request)
+        self._yoosee.logout()
+        return web.json_response({"connected": False}, headers={"Cache-Control": "no-store"})
 
     def _check_camera_client(self, request: web.Request) -> None:
         self._check_loopback_origin(request)
@@ -795,6 +850,13 @@ class LocalAPI:
             self.matter_pairing(), headers={"Cache-Control": "no-store"},
         )
 
+    async def dashboard(self, request: web.Request) -> web.Response:
+        """Serve the local control panel from the same-origin API."""
+        page = Path(__file__).resolve().parent.parent / "web" / "index.html"
+        if not page.is_file():
+            raise web.HTTPNotFound(text="Dashboard is not installed")
+        return web.FileResponse(page, headers={"Cache-Control": "no-store"})
+
     async def learn_ir(self, request: web.Request) -> web.Response:
         self._check_command_origin(request)
         brand, device_id = request.match_info["brand"], request.match_info["device_id"]
@@ -826,9 +888,15 @@ class LocalAPI:
                 self._camera_media = CameraMedia(self._camera_runtime_path)
             app = web.Application(client_max_size=1024 * 1024)
             app.add_routes([
+                web.get("/", self.dashboard),
+                web.get("/dashboard", self.dashboard),
                 web.get("/health", self.health),
                 web.get("/api/matter/pairing", self.get_matter_pairing),
                 web.get("/api/devices", self.list_devices),
+                web.get("/api/integrations/yoosee", self.yoosee_status),
+                web.post("/api/integrations/yoosee/login", self.yoosee_login),
+                web.get("/api/integrations/yoosee/devices", self.yoosee_devices),
+                web.delete("/api/integrations/yoosee", self.yoosee_logout),
                 web.post("/api/devices/onvif/{device_id}/sessions", self.create_camera_session),
                 web.post("/api/camera-sessions/{session_id}/ice", self.camera_ice),
                 web.post("/api/camera-sessions/{session_id}/answer", self.camera_answer),
