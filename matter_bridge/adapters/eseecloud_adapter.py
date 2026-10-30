@@ -1,7 +1,7 @@
 """EseeCloud LAN discovery and explicitly configured local HTTP camera streams.
 
-Discovery follows the EseeCloud 4.14.0.4 app's JSON search and only inventories
-cameras; it grants no control. Streaming proxies the documented
+Discovery follows the EseeCloud 4.14.0.4 app's JSON search and its new-NVR
+``SEARCH`` probe, and only inventories cameras; it grants no control. Streaming proxies the documented
 ``/livestream/{channel}`` source only for cameras whose owner has confirmed the
 model and local URL format in configuration.
 """
@@ -30,9 +30,13 @@ from matter_bridge.adapters.eseecloud_discovery import (
     DISCOVERY_PORT,
     DISCOVERY_SOURCE_PORT,
     MULTICAST_GROUP,
+    NVR_PORT,
     EseeCloudDiscoveryReply,
+    EseeCloudNvrReply,
     build_discovery_request,
+    build_nvr_request,
     parse_discovery_reply,
+    parse_nvr_reply,
 )
 from matter_bridge.adapters.eseecloud_protocol import (
     EseeCloudMediaReader,
@@ -46,6 +50,7 @@ DISCOVERY_TIMEOUT = 3.0
 DISCOVERY_TTL = 300.0
 MAX_DISCOVERED = 64
 LAN_DISCOVERY_PROTOCOL = "eseecloud_lan_12306"
+NVR_DISCOVERY_PROTOCOL = "eseecloud_lan_nvr_9013"
 
 
 class EseeCloudStreamBusyError(RuntimeError):
@@ -145,7 +150,8 @@ class EseeCloudAdapter(BaseAdapter):
             raise ValueError(f"Cannot load {device.brand} record into EseeCloud adapter")
         if device.device_id in self._targets:
             return
-        if (device.raw_metadata.get("discovery_protocol") != LAN_DISCOVERY_PROTOCOL
+        if (device.raw_metadata.get("discovery_protocol")
+                not in (LAN_DISCOVERY_PROTOCOL, NVR_DISCOVERY_PROTOCOL)
                 or device.device_type is not DeviceType.CAMERA
                 or not is_lan_unicast_address(device.ip)):
             raise ValueError("Stored EseeCloud camera has no matching private stream config")
@@ -165,15 +171,17 @@ class EseeCloudAdapter(BaseAdapter):
             self._record_reply(source_ip, reply)
         return list(self._devices.values())
 
-    async def _lan_search(self, timeout: float) -> dict[str, EseeCloudDiscoveryReply]:
-        """Broadcast the app's discovery request and collect replies by source IP."""
+    async def _lan_search(
+        self, timeout: float,
+    ) -> dict[str, EseeCloudDiscoveryReply | EseeCloudNvrReply]:
+        """Broadcast the app's discovery requests and collect replies by source IP."""
         loop = asyncio.get_running_loop()
         interfaces = [
             (local_ip, broadcast) for local_ip, broadcast in get_ipv4_broadcast_interfaces()
             if is_lan_unicast_address(local_ip)
         ]
         local_ips = {local_ip for local_ip, _ in interfaces}
-        replies: dict[str, EseeCloudDiscoveryReply] = {}
+        replies: dict[str, EseeCloudDiscoveryReply | EseeCloudNvrReply] = {}
 
         class ReplyProtocol(asyncio.DatagramProtocol):
             def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
@@ -181,7 +189,7 @@ class EseeCloudAdapter(BaseAdapter):
                 if (source_ip in local_ips or not is_lan_unicast_address(source_ip)
                         or len(replies) >= MAX_DISCOVERED):
                     return
-                reply = parse_discovery_reply(data)
+                reply = parse_discovery_reply(data) or parse_nvr_reply(data)
                 if reply is not None:
                     replies[source_ip] = reply
 
@@ -212,6 +220,7 @@ class EseeCloudAdapter(BaseAdapter):
                 logger.debug("Could not listen for EseeCloud replies", exc_info=True)
 
             request = build_discovery_request()
+            nvr_request = build_nvr_request(1)
             for local_ip, broadcast in interfaces:
                 # The app sends from UDP 57999 on its Wi-Fi address; also accept
                 # unicast replies sent back to that socket.
@@ -231,20 +240,39 @@ class EseeCloudAdapter(BaseAdapter):
                     except OSError:
                         logger.debug("Could not send EseeCloud search to %s", target,
                                      exc_info=True)
+                # NVR recorders answer the app's HDS search on UDP 9013 instead.
+                try:
+                    transport.sendto(nvr_request, ("255.255.255.255", NVR_PORT))
+                except OSError:
+                    logger.debug("Could not send EseeCloud NVR search", exc_info=True)
             await asyncio.sleep(timeout)
         finally:
             for transport in transports:
                 transport.close()
         return replies
 
-    def _record_reply(self, source_ip: str, reply: EseeCloudDiscoveryReply) -> None:
+    def _record_reply(
+        self, source_ip: str, reply: EseeCloudDiscoveryReply | EseeCloudNvrReply,
+    ) -> None:
         """Inventory a discovered camera without storing any reply credentials."""
-        metadata = {
-            "eseecloud_device_id": reply.device_id,
-            "eseecloud_device_type": reply.device_type,
-            "eseecloud_version": reply.version,
-            "eseecloud_max_channel": reply.max_channel,
-        }
+        if isinstance(reply, EseeCloudNvrReply):
+            remote_id, protocol = reply.esee_id, NVR_DISCOVERY_PROTOCOL
+            model, port = reply.device_model or "EseeCloud NVR", reply.http_port or 80
+            metadata = {
+                "eseecloud_device_id": reply.esee_id,
+                "eseecloud_device_type": reply.device_type,
+                "eseecloud_version": reply.software_version,
+                "eseecloud_max_channel": reply.channel_count,
+            }
+        else:
+            remote_id, protocol = reply.device_id, LAN_DISCOVERY_PROTOCOL
+            model, port = "EseeCloud camera", 80
+            metadata = {
+                "eseecloud_device_id": reply.device_id,
+                "eseecloud_device_type": reply.device_type,
+                "eseecloud_version": reply.version,
+                "eseecloud_max_channel": reply.max_channel,
+            }
         configured = next(
             (device for device_id, device in self._devices.items()
              if device_id in self._targets and device.ip == source_ip),
@@ -254,7 +282,7 @@ class EseeCloudAdapter(BaseAdapter):
             configured.raw_metadata.update(metadata)
             self._last_seen[configured.device_id] = time.monotonic()
             return
-        device_id = f"esee-{reply.device_id}"
+        device_id = f"esee-{remote_id}"
         device = self._devices.get(device_id)
         if device is None:
             if sum(1 for d in self._devices if d not in self._targets) >= MAX_DISCOVERED:
@@ -263,15 +291,15 @@ class EseeCloudAdapter(BaseAdapter):
                 brand=self.BRAND,
                 device_id=device_id,
                 ip=source_ip,
-                port=80,
-                model="EseeCloud camera",
-                name=f"EseeCloud {reply.device_id}",
+                port=port,
+                model=model,
+                name=f"EseeCloud {remote_id}",
                 device_type=DeviceType.CAMERA,
                 raw_metadata={},
             )
             self._devices[device_id] = device
         device.ip = source_ip
-        device.raw_metadata.update({**metadata, "discovery_protocol": LAN_DISCOVERY_PROTOCOL})
+        device.raw_metadata.update({**metadata, "discovery_protocol": protocol})
         self._last_seen[device_id] = time.monotonic()
 
     async def authenticate(self, device: DeviceInfo) -> bool:
