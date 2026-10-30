@@ -7,12 +7,15 @@ import unittest
 
 from matter_bridge.adapters.eseecloud_adapter import (
     LAN_DISCOVERY_PROTOCOL,
+    NVR_DISCOVERY_PROTOCOL,
     EseeCloudAdapter,
 )
 from matter_bridge.adapters.eseecloud_discovery import (
     REQUEST_ID,
     build_discovery_request,
+    build_nvr_request,
     parse_discovery_reply,
+    parse_nvr_reply,
 )
 from matter_bridge.core.base_adapter import DeviceInfo, DeviceType
 
@@ -74,6 +77,46 @@ class EseeCloudDiscoveryProtocolTests(unittest.TestCase):
         self.assertIsNone(reply.max_channel)
 
 
+NVR_REPLY = (
+    b'garbage {"Esee-ID":"EE12345","Device-ID":"dev-1","Device-Model":"NVR-8",'
+    b'"Device-Type":"NVR","Channel-Cnt":8,"Software-Version":"1.2.3",'
+    b'"Nonce":"secret-nonce","Ver":"1.1","Capabilities":{"Http-Port":8080}}'
+)
+
+
+class EseeCloudNvrProtocolTests(unittest.TestCase):
+    def test_request_matches_app_bytes(self) -> None:
+        self.assertEqual(
+            build_nvr_request(2),
+            b"SEARCH * HDS/1.1\r\nCSeq:2\r\n"
+            b"Client-ID:CeCOlDpmTuzViBQDgbrPgFkfnyyzNabc\r\n"
+            b"Accept-Type:text/HDP\r\nContent-Length:13\r\n"
+            b'X-Search-Type:NVR\r\n{"Ver":"1.1"}',
+        )
+        with self.assertRaises(ValueError):
+            build_nvr_request(True)  # type: ignore[arg-type]
+
+    def test_parses_reply_without_nonce(self) -> None:
+        reply = parse_nvr_reply(NVR_REPLY)
+        assert reply is not None
+        self.assertEqual(reply.esee_id, "EE12345")
+        self.assertEqual(reply.device_model, "NVR-8")
+        self.assertEqual(reply.channel_count, 8)
+        self.assertEqual(reply.http_port, 8080)
+        self.assertNotIn("secret-nonce", repr(reply))
+
+    def test_rejects_missing_id_and_malformed_data(self) -> None:
+        self.assertIsNone(parse_nvr_reply(b'{"Device-ID":"dev-1"}'))
+        self.assertIsNone(parse_nvr_reply(b'{"Esee-ID":""}'))
+        self.assertIsNone(parse_nvr_reply(b"no json"))
+        self.assertIsNone(parse_nvr_reply(b"[1]"))
+        self.assertIsNone(parse_nvr_reply(b'{"Esee-ID":"x"}' + b" " * 9000))
+        reply = parse_nvr_reply(b'{"Esee-ID":"E1","Channel-Cnt":"8","Capabilities":42}')
+        assert reply is not None
+        self.assertIsNone(reply.channel_count)
+        self.assertIsNone(reply.http_port)
+
+
 class EseeCloudDiscoveryAdapterTests(unittest.IsolatedAsyncioTestCase):
     async def test_discovered_camera_is_inventory_only(self) -> None:
         adapter = EseeCloudAdapter()
@@ -103,6 +146,23 @@ class EseeCloudDiscoveryAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(porch.raw_metadata["eseecloud_device_id"], "1234567890")
         self.assertEqual(porch.raw_metadata["discovery_protocol"],
                          "eseecloud_http_stream_config")
+
+    async def test_nvr_reply_is_inventory_only(self) -> None:
+        adapter = EseeCloudAdapter()
+        reply = parse_nvr_reply(NVR_REPLY)
+        assert reply is not None
+        adapter._record_reply("192.168.1.60", reply)
+        device = adapter.get_device("esee-EE12345")
+        assert device is not None
+        self.assertEqual(device.port, 8080)
+        self.assertEqual(device.model, "NVR-8")
+        self.assertEqual(device.raw_metadata["discovery_protocol"], NVR_DISCOVERY_PROTOCOL)
+        self.assertFalse(adapter.has_stream(device.device_id))
+        self.assertFalse(await adapter.authenticate(device))
+        self.assertNotIn("secret-nonce", repr(device))
+        reloaded = EseeCloudAdapter()
+        reloaded.load_device(device)
+        self.assertIsNotNone(reloaded.get_device("esee-EE12345"))
 
     def test_load_device_accepts_discovered_records_only(self) -> None:
         adapter = EseeCloudAdapter()
